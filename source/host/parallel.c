@@ -105,7 +105,7 @@ static struct {
 	worker caller;           /* the asking thread's own, for its share */
 	bool caller_ready;
 	/* the current call */
-	volatile uint64_t generation;
+	volatile uint64_t generation;  /* (call number << 8) | workers taking part */
 	uintptr_t fn, arg;
 	uint32_t n;
 	volatile uint32_t next;  /* the next task index to hand out */
@@ -133,11 +133,15 @@ static void *worker_main(void *arg) {
 	worker *me = (worker *)arg;
 	mb_prepare_worker_thread();
 	t_worker_ctx = &me->ctx;
+	const int idx = (int)(me - P.w);
 	uint64_t seen = 0;
+	bool idle = false;       /* sat out the last call: sleep at once */
 	for (;;) {
 		/* Spin a little before sleeping: a renderer asks hundreds of times a
-		 * frame, and a sleep and a wake cost more than a short task. */
-		int spins = 0;
+		 * frame, and a sleep and a wake cost more than a short task. A worker
+		 * that was not needed last time goes straight to sleep, so that a
+		 * pool larger than the work does not burn the cores the work needs. */
+		int spins = idle ? 20000 : 0;
 		while (__atomic_load_n(&P.generation, __ATOMIC_ACQUIRE) == seen && spins < 20000) {
 			__builtin_ia32_pause();
 			spins++;
@@ -147,7 +151,14 @@ static void *worker_main(void *arg) {
 			while (P.generation == seen) pthread_cond_wait(&P.go, &P.lock);
 			pthread_mutex_unlock(&P.lock);
 		}
-		seen = __atomic_load_n(&P.generation, __ATOMIC_ACQUIRE);
+		/* the generation names the workers it needs, in one word: a worker
+		 * that sat out an earlier call may wake late, and must not mistake
+		 * the next call's count for its own */
+		const uint64_t g = __atomic_load_n(&P.generation, __ATOMIC_ACQUIRE);
+		const int active = (int)(g & 0xff);
+		seen = g;
+		idle = idx >= active;
+		if (idle) continue;  /* not counted: the caller waits for the active ones only */
 		const uint32_t n = P.n;
 		for (;;) {
 			const uint32_t i = __atomic_fetch_add(&P.next, 1, __ATOMIC_ACQ_REL);
@@ -160,7 +171,7 @@ static void *worker_main(void *arg) {
 				break;
 			}
 		}
-		if (__atomic_add_fetch(&P.finished, 1, __ATOMIC_ACQ_REL) == P.started) {
+		if (__atomic_add_fetch(&P.finished, 1, __ATOMIC_ACQ_REL) == active) {
 			pthread_mutex_lock(&P.lock);
 			pthread_cond_signal(&P.done_cv);
 			pthread_mutex_unlock(&P.lock);
@@ -235,7 +246,12 @@ static bool start_workers(int want) {
 }
 
 mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_t n) {
-	const int want = mb_parallel_workers();
+	int want = mb_parallel_workers();
+	/* a worker more than the host has cores only waits for its turn while
+	 * the others spin waiting for it (which thread runs a task never
+	 * matters, so this is the same machine) */
+	const long cores = sysconf(_SC_NPROCESSORS_ONLN);
+	if (cores > 0 && want > cores - 1) want = (int)(cores - 1);
 	if (main->fs_swap) return -ENOSYS;
 	if (n == 0) return 0;
 	if (n > 0xffffffffu) return -EINVAL;
@@ -244,10 +260,14 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 		P.caller_ready = true;
 	}
 	/* the pool is made the first time, at the size asked for then; a later
-	 * change of the count takes a new process (every worker takes part in
-	 * every call, so the pool cannot shrink under a running machine) */
+	 * change of the count takes a new process */
 	if (want > 0 && P.started == 0 && !start_workers(want)) return -ENOSYS;
-	for (int i = 0; i < P.started; i++) prepare(&P.w[i], main);
+	/* no more workers than there are tasks besides the caller's: the rest
+	 * stay asleep (which thread runs a task never matters, so this is the
+	 * same machine) */
+	int active = P.started;
+	if ((uintptr_t)active > n - 1) active = (int)(n - 1);
+	for (int i = 0; i < active; i++) prepare(&P.w[i], main);
 	prepare(&P.caller, main);
 	P.fn = fn;
 	P.arg = arg;
@@ -255,9 +275,10 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 	__atomic_store_n(&P.next, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&P.finished, 0, __ATOMIC_RELAXED);
 	P.running = true;
-	if (P.started > 0) {
+	if (active > 0) {
 		pthread_mutex_lock(&P.lock);
-		__atomic_add_fetch(&P.generation, 1, __ATOMIC_ACQ_REL);
+		const uint64_t g = __atomic_load_n(&P.generation, __ATOMIC_RELAXED);
+		__atomic_store_n(&P.generation, ((g >> 8) + 1) << 8 | (uint64_t)active, __ATOMIC_RELEASE);
 		pthread_cond_broadcast(&P.go);
 		pthread_mutex_unlock(&P.lock);
 	}
@@ -275,13 +296,13 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 	t_worker_ctx = NULL;
 	/* wait: spin first, for the same reason the workers do */
 	int spins = 0;
-	while (__atomic_load_n(&P.finished, __ATOMIC_ACQUIRE) != P.started && spins < 200000) {
+	while (__atomic_load_n(&P.finished, __ATOMIC_ACQUIRE) != active && spins < 200000) {
 		__builtin_ia32_pause();
 		spins++;
 	}
-	if (__atomic_load_n(&P.finished, __ATOMIC_ACQUIRE) != P.started) {
+	if (__atomic_load_n(&P.finished, __ATOMIC_ACQUIRE) != active) {
 		pthread_mutex_lock(&P.lock);
-		while (__atomic_load_n(&P.finished, __ATOMIC_ACQUIRE) != P.started)
+		while (__atomic_load_n(&P.finished, __ATOMIC_ACQUIRE) != active)
 			pthread_cond_wait(&P.done_cv, &P.lock);
 		pthread_mutex_unlock(&P.lock);
 	}
@@ -291,7 +312,7 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 		snprintf(why, sizeof why, "%s", mb_host_death_text(main));
 		mb_host_guest_death(main, "a task run in parallel died: %s", why);
 	}
-	for (int i = 0; i < P.started; i++)
+	for (int i = 0; i < active; i++)
 		if (P.w[i].failed) {
 			/* the worker's death said why; the machine's death says it again,
 			 * since the machine's reason replaces the worker's */
