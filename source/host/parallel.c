@@ -94,11 +94,15 @@ typedef struct {
 	mb_context ctx;
 	mb_range stack;          /* host memory, with a guard page at the bottom */
 	volatile int failed;
+	/* where this worker sleeps: a call wakes only the workers it needs, so
+	 * the rest of a large pool costs nothing */
+	pthread_mutex_t lock;
+	pthread_cond_t go;
 } worker;
 
 static struct {
 	pthread_mutex_t lock;
-	pthread_cond_t go, done_cv;
+	pthread_cond_t done_cv;
 	int requested;           /* how many workers to use besides the caller */
 	int started;             /* how many exist */
 	worker w[MB_PARALLEL_MAX];
@@ -111,7 +115,7 @@ static struct {
 	volatile uint32_t next;  /* the next task index to hand out */
 	volatile int finished;   /* workers done with this generation */
 	volatile bool running;
-} P = { .lock = PTHREAD_MUTEX_INITIALIZER, .go = PTHREAD_COND_INITIALIZER, .done_cv = PTHREAD_COND_INITIALIZER, .requested = -1 };
+} P = { .lock = PTHREAD_MUTEX_INITIALIZER, .done_cv = PTHREAD_COND_INITIALIZER, .requested = -1 };
 
 /* the worker this thread is (host C only: guest code never runs with a %fs this
  * file could read through, since fs_swap guests are refused) */
@@ -147,9 +151,9 @@ static void *worker_main(void *arg) {
 			spins++;
 		}
 		if (__atomic_load_n(&P.generation, __ATOMIC_ACQUIRE) == seen) {
-			pthread_mutex_lock(&P.lock);
-			while (P.generation == seen) pthread_cond_wait(&P.go, &P.lock);
-			pthread_mutex_unlock(&P.lock);
+			pthread_mutex_lock(&me->lock);
+			while (__atomic_load_n(&P.generation, __ATOMIC_ACQUIRE) == seen) pthread_cond_wait(&me->go, &me->lock);
+			pthread_mutex_unlock(&me->lock);
 		}
 		/* the generation names the workers it needs, in one word: a worker
 		 * that sat out an earlier call may wake late, and must not mistake
@@ -234,6 +238,8 @@ static bool start_workers(int want) {
 		worker *w = &P.w[P.started];
 		memset(w, 0, sizeof *w);
 		if (!map_stack(w)) return false;
+		pthread_mutex_init(&w->lock, NULL);
+		pthread_cond_init(&w->go, NULL);
 		/* a worker that is being created must not see a generation it
 		 * should not run: it starts from the current one */
 		if (pthread_create(&w->thread, NULL, worker_main, w) != 0) {
@@ -276,11 +282,15 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 	__atomic_store_n(&P.finished, 0, __ATOMIC_RELAXED);
 	P.running = true;
 	if (active > 0) {
-		pthread_mutex_lock(&P.lock);
 		const uint64_t g = __atomic_load_n(&P.generation, __ATOMIC_RELAXED);
 		__atomic_store_n(&P.generation, ((g >> 8) + 1) << 8 | (uint64_t)active, __ATOMIC_RELEASE);
-		pthread_cond_broadcast(&P.go);
-		pthread_mutex_unlock(&P.lock);
+		/* wake the ones taking part; the others may wake later on their own,
+		 * see they are not needed, and sleep again */
+		for (int i = 0; i < active; i++) {
+			pthread_mutex_lock(&P.w[i].lock);
+			pthread_cond_signal(&P.w[i].go);
+			pthread_mutex_unlock(&P.w[i].lock);
+		}
 	}
 	/* the caller's share, through its own context and stack */
 	t_worker_ctx = &P.caller.ctx;
