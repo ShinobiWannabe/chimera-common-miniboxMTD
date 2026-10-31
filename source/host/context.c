@@ -80,6 +80,17 @@ uintptr_t *mb_thread_block(void) { return g_tib; }
 #endif
 
 
+/* A thread made by the host for parallel tasks (parallel.c). It inherits its
+ * creator's gs base, which names the CREATOR's block - and mb_prepare_thread
+ * leaves a base that is already set alone - so two threads would share one
+ * context slot and each overwrite the other's. Its own block, always. */
+void mb_prepare_worker_thread(void) {
+	init_interop_area();
+#ifndef _WIN32
+	syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, (uintptr_t)&g_tib[0]);
+#endif
+}
+
 void mb_prepare_thread(void) {
 	init_interop_area();
 #ifndef _WIN32

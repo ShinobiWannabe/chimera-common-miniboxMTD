@@ -731,3 +731,35 @@ The revision is independent of the machine-spec version: v2 and v3 cores alike
 get the corrected answers once rebuilt. A rebuilt core is a new package, with
 its own hash, so a project pinned to the old package keeps the old answers.
 
+
+## Parallel tasks (chimeraMTD fork, 2026-10-31, additive, experimental)
+
+This section exists in the chimeraMTD fork only. Upstream miniBox runs one
+guest thread at a time on one host thread, and this keeps that for everything
+except one call.
+
+- **wbx_parallel_for (2001)**: `(fn, arg, n)`. The host calls `fn(arg, i)` for
+  every `i` from 0 to `n-1` on its own worker threads and returns 0 when all of
+  them have returned. Nothing else in the guest runs meanwhile: the calling
+  thread is parked in the call. Answers ENOSYS when the host has no workers
+  (the default; `wbx_set_parallel_workers` or `MB_PARALLEL_WORKERS` turns them
+  on, Linux only) or the guest keeps its own `%fs` (it declares thread locals).
+  The guest kit's `waterbox_parallel.h` makes the call and, on any refusal,
+  runs the same loop itself, in order, keeping `errno` as it was. So a guest
+  built with it is the same machine whether the host has workers or not.
+- Each task runs with the guest's floating-point control words as they were
+  when the call was made, on a stack of its own outside the machine (not in
+  any state), with the guest's thread pointer.
+- A task that faults or makes a system call ends the machine after every
+  worker has finished, as a crash on the main thread would; the process goes on.
+- **The rules a task must keep** (documented, not enforced, like section 10):
+  write only memory no other task of the same call reads or writes; make no
+  system call (so no malloc, stdio, locks or threads); use no thread locals,
+  `errno` included; call no host callback; leave the control words alone. A
+  task that breaks the first rule makes the machine depend on the host's
+  schedule. The check is to run the same machine with the feature off and
+  with several workers and compare.
+- Proven by `tests/parallel`: the picture and a hash of the whole savestate
+  are identical with the feature off and with 1, 2, 4 and 8 workers; tasks see
+  a rounding mode the guest set before the call; a task's system call and a
+  task's fault each end the machine and not the process.

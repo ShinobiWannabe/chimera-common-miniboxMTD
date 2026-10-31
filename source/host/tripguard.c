@@ -62,6 +62,20 @@ static uintptr_t gs_context_slot(void) {
 #endif
 }
 
+/* The context of the guest code this thread runs. One machine runs one thread
+ * of guest code at a time, named by mb_guest_ctx - except while a parallel call
+ * runs (parallel.c), when several workers run tasks of it, each with a context
+ * of its own, and a fault has to be charged to the worker that took it: its
+ * stack, its escape record, its parked %fs. Outside a parallel call this is
+ * mb_guest_ctx exactly, and costs one load. */
+static mb_context *active_ctx(void) {
+	if (mb_parallel_running()) {
+		mb_context *w = mb_parallel_ctx_of_slot(gs_context_slot());
+		if (w != NULL) return w;
+	}
+	return mb_guest_ctx;
+}
+
 /* A fault the guest's own code took, with a machine to charge it to: that is a
  * guest dying, which the host survives (mb_host_guest_death). The guest's own
  * code is either in its memory, or anywhere at all while the thread is inside
@@ -71,8 +85,8 @@ static uintptr_t gs_context_slot(void) {
  * else - a fault in host code, or with no machine running - is not, and stays
  * fatal. */
 static bool guest_can_die_here(uintptr_t rip) {
-	return mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0
-		&& (code_in_guest(rip) || gs_context_slot() == (uintptr_t)mb_guest_ctx);
+	return active_ctx() != NULL && active_ctx()->host_ptr != 0
+		&& (code_in_guest(rip) || gs_context_slot() == (uintptr_t)active_ctx());
 }
 
 /* Where an address IS, in the words the layout uses.
@@ -88,7 +102,7 @@ static bool guest_can_die_here(uintptr_t rip) {
  * which is right, because its layout is the live one.
  *
  * It is a pointer INTO the mb_host, so the host that set it must take it back
- * when it is destroyed, exactly as it takes back mb_guest_ctx. It did not, and
+ * when it is destroyed, exactly as it takes back active_ctx(). It did not, and
  * chimera#127 is what that costs: a PS3 core died, the machine was torn down,
  * and the next fault anywhere in the process - an ordinary one, the kind the
  * CLR raises and handles every day - reached say_region below, read the freed
@@ -300,7 +314,7 @@ static bool rip_bytes_readable(uintptr_t rip) {
 __attribute__((no_stack_protector))
 static void mb_restore_guest_fs(uintptr_t at_fault) {
 	if (drop_fs_for_test()) at_fault = 0;
-	mb_wrfsbase(mb_guest_ctx->thread_area);
+	mb_wrfsbase(active_ctx()->thread_area);
 	/* What %fs held WHEN THE GUEST FAULTED, sampled by the caller before it
 	 * swapped anything - reading it here would only report the handler's own
 	 * swap back to the host.
@@ -308,7 +322,7 @@ static void mb_restore_guest_fs(uintptr_t at_fault) {
 	 * mb_early_tp is not a loss either: musl swaps thread_area in userspace,
 	 * so %fs legitimately still holds the stand-in pointer until the next
 	 * boundary, and installing the real one here is right, and silent. */
-	if (at_fault != mb_guest_ctx->thread_area && at_fault != mb_early_tp) {
+	if (at_fault != active_ctx()->thread_area && at_fault != mb_early_tp) {
 		static bool reported = false;
 		if (!reported) {   /* once: this path runs thousands of times a second */
 			reported = true;
@@ -365,7 +379,7 @@ static bool ask_guest(uintptr_t addr, bool write, bool from_host_code) {
 	/* guest code runs from here: a fault it takes on a held page is served */
 	const int phase = fault_phase();
 	fault_phase_set(MB_PHASE_GUEST);
-	mb_context *const in = mb_guest_ctx;
+	mb_context *const in = active_ctx();
 	if (in) InterlockedIncrement(&in->guest_handlers);
 #ifdef MB_HAVE_FSBASE
 	/* ...and with the guest's own thread pointer, when it owns %fs. The
@@ -373,12 +387,12 @@ static bool ask_guest(uintptr_t addr, bool write, bool from_host_code) {
 	 * the HOST's thread locals and arrives at its system calls with a base
 	 * the dispatcher refuses ("something outside a fault took it"). Host C
 	 * runs again after it, so the host's comes back. */
-	const bool swap = mb_fs_swap && mb_guest_ctx && mb_guest_ctx->fs_swap;
+	const bool swap = mb_fs_swap && active_ctx() && active_ctx()->fs_swap;
 	const uintptr_t host_fs = swap ? mb_rdfsbase() : 0;
 	/* the very base the guest faulted on, when the handler sampled a live one:
 	 * the faulting thread's own, whichever thread that is */
 	const uintptr_t sampled = guest_fs_sampled();
-	if (swap) mb_wrfsbase(sampled && sampled != mb_early_tp ? sampled : mb_guest_ctx->thread_area);
+	if (swap) mb_wrfsbase(sampled && sampled != mb_early_tp ? sampled : active_ctx()->thread_area);
 #endif
 	const bool handled = g_guest_fault((uint64_t)addr, write ? 1 : 0) != 0;
 #ifdef MB_HAVE_FSBASE
@@ -666,7 +680,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * see the Windows handler below, where that is the normal case.
 	 * No %fs instruction runs here unless the probe said they exist
 	 * (mb_fs_swap): on a host without them this whole block is skipped. */
-	const bool guest_rip = mb_fs_swap && mb_guest_ctx
+	const bool guest_rip = mb_fs_swap && active_ctx()
 	                       && rip_in_guest((uintptr_t)((ucontext_t *)ucontext)
 	                                       ->uc_mcontext.gregs[REG_RIP]);
 	/* ...or by the pointer itself, as handler_foreign asks it: code outside
@@ -675,12 +689,12 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * address - must not have host C run on it either (2026-10-18). The
 	 * guest's pointer is its thread area or the early stand-in, and never the
 	 * host's own. */
-	const uintptr_t tp_now = mb_fs_swap && mb_guest_ctx ? mb_rdfsbase() : 0;
-	const bool guest_tp = !guest_rip && mb_fs_swap && mb_guest_ctx && mb_guest_ctx->fs_swap
-	                      && mb_guest_ctx->host_fs && tp_now != mb_guest_ctx->host_fs
-	                      && (tp_now == mb_guest_ctx->thread_area || (mb_early_tp && tp_now == mb_early_tp));
+	const uintptr_t tp_now = mb_fs_swap && active_ctx() ? mb_rdfsbase() : 0;
+	const bool guest_tp = !guest_rip && mb_fs_swap && active_ctx() && active_ctx()->fs_swap
+	                      && active_ctx()->host_fs && tp_now != active_ctx()->host_fs
+	                      && (tp_now == active_ctx()->thread_area || (mb_early_tp && tp_now == mb_early_tp));
 	const uintptr_t fs_at_fault = guest_rip ? tp_now : 0;
-	if ((guest_rip || guest_tp) && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
+	if ((guest_rip || guest_tp) && active_ctx()->host_fs) mb_wrfsbase(active_ctx()->host_fs);
 	const uintptr_t fault = (uintptr_t)info->si_addr;
 	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP];
 	/* A %fs access with the base already lost is the repair, not a fault to
@@ -709,11 +723,11 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * own. (Windows is different: host code never uses FS there, and a guest
 	 * that reads %fs without owning it needs its thread pointer - see veh_fs.) */
 	const uintptr_t fs_want = !guest_rip ? 0
-	                        : mb_guest_ctx->fs_swap ? mb_guest_ctx->thread_area : mb_guest_ctx->host_fs;
+	                        : active_ctx()->fs_swap ? active_ctx()->thread_area : active_ctx()->host_fs;
 	if (guest_rip && fs_at_fault != fs_want
 	    && fs_at_fault != mb_early_tp && owner_of(fault) == NULL
 	    && rip_bytes_readable(rip) && insn_has_fs_prefix(rip)) {
-		if (mb_guest_ctx->fs_swap) {
+		if (active_ctx()->fs_swap) {
 			mb_restore_guest_fs(fs_at_fault);
 		} else {
 			/* the host's base is already back in the register (above) */
@@ -737,7 +751,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * that preserves the base across a signal, and the right one on a host
 	 * that does not. Only for guests that own %fs: the rest keep the host's,
 	 * and rewriting it here would trade it for the thread pointer. */
-	if (guest_rip && mb_guest_ctx->fs_swap) mb_restore_guest_fs(fs_at_fault);
+	if (guest_rip && active_ctx()->fs_swap) mb_restore_guest_fs(fs_at_fault);
 	else if (guest_tp) mb_wrfsbase(tp_now);
 #else
 	handler_inner(sig, info, ucontext);
@@ -978,16 +992,16 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 			const bool refused = g_protect_refused;
 			g_protect_refused = false;
 			const bool escapable = halted
-				? mb_host_guest_death_in_handler(mb_guest_ctx,
+				? mb_host_guest_death_in_handler(active_ctx(),
 					"the core stopped itself after finding its own memory corrupt (a halt at %p)", (void *)rip)
 				: refused
-				? mb_host_guest_death_in_handler(mb_guest_ctx,
+				? mb_host_guest_death_in_handler(active_ctx(),
 					"the system refused a memory protection change the core's write to %p needed"
 					" (on Linux, usually vm.max_map_count; at %p)", (void *)fault, (void *)rip)
-				: mb_host_guest_death_in_handler(mb_guest_ctx,
+				: mb_host_guest_death_in_handler(active_ctx(),
 					"the core crashed: it %s address %p (at %p)", write ? "wrote to" : "read or ran", (void *)fault, (void *)rip);
 			if (escapable) {
-				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
+				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)active_ctx()->esc_rsp;
 				uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
 				rethrow = false;
 			}
@@ -1046,7 +1060,7 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 	if (guest_can_die_here(rip)) {
 #ifdef MB_HAVE_FSBASE
 		/* host C from here on, which needs the host's %fs */
-		if (mb_guest_ctx->fs_swap && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
+		if (active_ctx()->fs_swap && active_ctx()->host_fs) mb_wrfsbase(active_ctx()->host_fs);
 #endif
 		mb_diag_banner(sig == SIGILL ? "the guest ran an illegal instruction" : "the guest divided by zero");
 		say_code_and_regs((const unsigned char *)rip,
@@ -1059,10 +1073,10 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 		                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
 		                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
 		const bool escapable = sig == SIGILL
-			? mb_host_guest_death_in_handler(mb_guest_ctx, "the core ran an illegal instruction at %p", (void *)rip)
-			: mb_host_guest_death_in_handler(mb_guest_ctx, "the core divided by zero at %p", (void *)rip);
+			? mb_host_guest_death_in_handler(active_ctx(), "the core ran an illegal instruction at %p", (void *)rip)
+			: mb_host_guest_death_in_handler(active_ctx(), "the core divided by zero at %p", (void *)rip);
 		if (escapable) {
-				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
+				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)active_ctx()->esc_rsp;
 				uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
 				leave_every_handler_frame(uc);
 			return;
@@ -1099,29 +1113,29 @@ static void handler_stop(int sig, siginfo_t *info, void *ucontext) {
 	 * Only for a guest pointer (the rip in guest code, or one of the guest's
 	 * thread pointers): the frontend's own threads get this signal never,
 	 * but a stray one is left exactly as it came. */
-	const uintptr_t tp_now = mb_fs_swap && mb_guest_ctx ? mb_rdfsbase() : 0;
-	const bool guest_tp = mb_fs_swap && mb_guest_ctx && mb_guest_ctx->fs_swap && mb_guest_ctx->host_fs
-		&& tp_now != mb_guest_ctx->host_fs
-		&& (rip_in_guest(rip) || tp_now == mb_guest_ctx->thread_area || (mb_early_tp && tp_now == mb_early_tp));
-	if (guest_tp) mb_wrfsbase(mb_guest_ctx->host_fs);
+	const uintptr_t tp_now = mb_fs_swap && active_ctx() ? mb_rdfsbase() : 0;
+	const bool guest_tp = mb_fs_swap && active_ctx() && active_ctx()->fs_swap && active_ctx()->host_fs
+		&& tp_now != active_ctx()->host_fs
+		&& (rip_in_guest(rip) || tp_now == active_ctx()->thread_area || (mb_early_tp && tp_now == mb_early_tp));
+	if (guest_tp) mb_wrfsbase(active_ctx()->host_fs);
 #else
 	const bool guest_tp = false;
 	const uintptr_t tp_now = 0;
 #endif
-	if (mb_guest_ctx != NULL && mb_guest_ctx->stop_pending && g_fault_depth == 0
-	    && guest_can_die_here(rip) && mb_stop_due(mb_guest_ctx)) {
+	if (active_ctx() != NULL && active_ctx()->stop_pending && g_fault_depth == 0
+	    && guest_can_die_here(rip) && mb_stop_due(active_ctx())) {
 #ifdef MB_HAVE_FSBASE
 		/* host C from here on, which needs the host's %fs */
-		if (mb_guest_ctx->fs_swap && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
+		if (active_ctx()->fs_swap && active_ctx()->host_fs) mb_wrfsbase(active_ctx()->host_fs);
 #endif
-		mb_guest_ctx->stop_pending = 0;
-		mb_host_guest_death_in_handler(mb_guest_ctx, "%s", mb_host_stop_reason(mb_guest_ctx));
-		uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
+		active_ctx()->stop_pending = 0;
+		mb_host_guest_death_in_handler(active_ctx(), "%s", mb_host_stop_reason(active_ctx()));
+		uc->uc_mcontext.gregs[REG_RSP] = (greg_t)active_ctx()->esc_rsp;
 		uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
 		leave_every_handler_frame(uc);
 		return;
 	}
-	if (mb_guest_ctx != NULL && mb_guest_ctx->stop_pending) {   /* ours: asked again later */
+	if (active_ctx() != NULL && active_ctx()->stop_pending) {   /* ours: asked again later */
 #ifdef MB_HAVE_FSBASE
 		if (guest_tp) mb_wrfsbase(tp_now);
 #endif
@@ -1189,7 +1203,7 @@ static void handler_foreign(int sig, siginfo_t *info, void *ucontext) {
 	 * ever owns %fs, so there is nothing to put back either. */
 	const bool swaps = mb_fs_swap;
 	const uintptr_t tp = swaps ? mb_rdfsbase() : 0;
-	mb_context *c = mb_guest_ctx;
+	mb_context *c = active_ctx();
 	/* the guest's pointer is in when this thread was stopped in guest code, or
 	 * holds one of the guest's pointers (a transition, between the swap and
 	 * the jump) - and is not the host's own */
@@ -1350,16 +1364,16 @@ int mb_tripguard_stop_thread(void *thread) {
 	memset(&c, 0, sizeof c);
 	c.ContextFlags = CONTEXT_FULL;
 	int sent = 0;
-	if (GetThreadContext(t, &c) && mb_guest_ctx != NULL && mb_guest_ctx->stop_pending
+	if (GetThreadContext(t, &c) && active_ctx() != NULL && active_ctx()->stop_pending
 	    && code_in_guest((uintptr_t)c.Rip)) {
-		const long handling = mb_guest_ctx->handling, in_handler = mb_guest_ctx->guest_handlers;
+		const long handling = active_ctx()->handling, in_handler = active_ctx()->guest_handlers;
 		const bool idle = handling == 0;
 		const bool in_own_handler = in_handler > 0 && handling == in_handler;
-		if ((idle || in_own_handler) && mb_stop_due(mb_guest_ctx)) {
-			mb_guest_ctx->stop_pending = 0;
-			mb_host_guest_death_in_handler(mb_guest_ctx, "%s", mb_host_stop_reason(mb_guest_ctx));
+		if ((idle || in_own_handler) && mb_stop_due(active_ctx())) {
+			active_ctx()->stop_pending = 0;
+			mb_host_guest_death_in_handler(active_ctx(), "%s", mb_host_stop_reason(active_ctx()));
 			if (idle) {
-				c.Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+				c.Rsp = (DWORD64)active_ctx()->esc_rsp;
 				c.Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
 			} else {
 				c.Rip = (DWORD64)(uintptr_t)mb_stop_trap;
@@ -1375,7 +1389,7 @@ int mb_tripguard_stop_thread(void *thread) {
 __attribute__((no_stack_protector))
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 	const DWORD last_error = GetLastError();
-	mb_context *const handled = mb_guest_ctx;
+	mb_context *const handled = active_ctx();
 	if (handled) InterlockedIncrement(&handled->handling);
 	const LONG r = veh_fs(ep);
 	if (handled) InterlockedDecrement(&handled->handling);
@@ -1399,7 +1413,7 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 __attribute__((no_stack_protector))
 static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep) {
 #ifdef MB_HAVE_FSBASE
-	const bool guest_rip = mb_fs_swap && mb_guest_ctx
+	const bool guest_rip = mb_fs_swap && active_ctx()
 	                       && rip_in_guest((uintptr_t)ep->ContextRecord->Rip);
 	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
 	const uintptr_t fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
@@ -1419,7 +1433,7 @@ static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep) {
 	 * and only the instruction says what it was. A fault that arrives back
 	 * with %fs already correct is the guest's own and goes below as it
 	 * always did - which is what bounds the retry to one pass. */
-	if (guest_rip && fs_at_fault != mb_guest_ctx->thread_area
+	if (guest_rip && fs_at_fault != active_ctx()->thread_area
 	    && fs_at_fault != mb_early_tp && owner_of(fault) == NULL
 	    && rip_bytes_readable(rip) && insn_has_fs_prefix(rip)) {
 		mb_restore_guest_fs(fs_at_fault);
@@ -1428,7 +1442,7 @@ static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep) {
 	LONG r = veh_inner(ep);
 	/* As above, for the fault a handled trip or ask leaves behind: only for
 	 * guests that own %fs, whose base this restores. */
-	if (guest_rip && mb_guest_ctx->fs_swap && r == EXCEPTION_CONTINUE_EXECUTION)
+	if (guest_rip && active_ctx()->fs_swap && r == EXCEPTION_CONTINUE_EXECUTION)
 		mb_restore_guest_fs(fs_at_fault);
 	return r;
 #else
@@ -1441,8 +1455,8 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	/* a stop sent from inside the guest's own fault handler (mb_tripguard_stop_thread):
 	 * the death is already recorded */
 	if (code == STATUS_ILLEGAL_INSTRUCTION && ep->ContextRecord->Rip == (DWORD64)(uintptr_t)mb_stop_trap
-	    && mb_guest_ctx != NULL && mb_guest_ctx->esc_rsp != 0) {
-		ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+	    && active_ctx() != NULL && active_ctx()->esc_rsp != 0) {
+		ep->ContextRecord->Rsp = (DWORD64)active_ctx()->esc_rsp;
 		ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
@@ -1477,10 +1491,10 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			                  (uintptr_t)c->R10, (uintptr_t)c->R11, (uintptr_t)c->R12, (uintptr_t)c->R13,
 			                  (uintptr_t)c->R14, (uintptr_t)c->R15);
 			if (guest_can_die_here(rip)
-			    && mb_host_guest_death_in_handler(mb_guest_ctx, code == STATUS_PRIVILEGED_INSTRUCTION
+			    && mb_host_guest_death_in_handler(active_ctx(), code == STATUS_PRIVILEGED_INSTRUCTION
 			           ? "the core stopped itself after finding its own memory corrupt (a halt at %p)"
 			           : "the core ran an illegal instruction at %p", (void *)rip)) {
-				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+				ep->ContextRecord->Rsp = (DWORD64)active_ctx()->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
 				report_end(phase_before);
 				return EXCEPTION_CONTINUE_EXECUTION;
@@ -1501,9 +1515,9 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			                  (uintptr_t)c->Rsi, (uintptr_t)c->Rdi, (uintptr_t)c->R8, (uintptr_t)c->R9,
 			                  (uintptr_t)c->R10, (uintptr_t)c->R11, (uintptr_t)c->R12, (uintptr_t)c->R13,
 			                  (uintptr_t)c->R14, (uintptr_t)c->R15);
-			if (mb_host_guest_death_in_handler(mb_guest_ctx, code == STATUS_INTEGER_DIVIDE_BY_ZERO
+			if (mb_host_guest_death_in_handler(active_ctx(), code == STATUS_INTEGER_DIVIDE_BY_ZERO
 			        ? "the core divided by zero at %p" : "the core overflowed a division at %p", (void *)rip)) {
-				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+				ep->ContextRecord->Rsp = (DWORD64)active_ctx()->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
 				report_end(phase_before);
 				return EXCEPTION_CONTINUE_EXECUTION;
@@ -1621,13 +1635,13 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 		const uintptr_t rip = (uintptr_t)c->Rip;
 		if (guest_can_die_here(rip)) {
 			const bool died = oom
-				? mb_host_guest_death_in_handler(mb_guest_ctx, "the computer is out of memory: Windows would not give the core "
+				? mb_host_guest_death_in_handler(active_ctx(), "the computer is out of memory: Windows would not give the core "
 				      "the memory it needs (at %p). Close other programs, or give the greenzone less memory, and go back to a safe frame",
 				      (void *)fault)
-				: mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: it %s address %p (at %p)",
+				: mb_host_guest_death_in_handler(active_ctx(), "the core crashed: it %s address %p (at %p)",
 				      write ? "wrote to" : "read or ran", (void *)fault, (void *)rip);
 			if (died) {
-				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+				ep->ContextRecord->Rsp = (DWORD64)active_ctx()->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
 				report_end(phase_before);
 				return EXCEPTION_CONTINUE_EXECUTION;

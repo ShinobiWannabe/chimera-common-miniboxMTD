@@ -637,6 +637,14 @@ extern uintptr_t mb_early_tp;
 
 void      mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt, mb_syscall_cb dispatch);
 void      mb_prepare_thread(void);              /* install gs base once per host thread */
+void      mb_prepare_worker_thread(void);       /* a parallel worker: its own gs base, always */
+/* parallel.c: run in parallel, then join (system call 2001) */
+mb_sword    mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_t n);
+int         mb_parallel_workers(void);
+void        mb_parallel_set_workers(int n);
+bool        mb_parallel_running(void);
+mb_context *mb_parallel_ctx_of_slot(uintptr_t slot);
+const char *mb_host_death_text(const mb_context *c);  /* host.c */
 #ifndef _WIN32
 /* this host thread's block at the gs base (context.c), and the words in it
  * that hand a fault to the trampoline that runs the guest's fault handler on

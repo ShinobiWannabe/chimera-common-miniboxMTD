@@ -104,6 +104,7 @@ void mb_host_stop_cancel(mb_host *h);
 void wbx_stop_from_here(mb_host *obj, mb_return *ret) { mb_host_stop_from_here(obj); ok(ret, 0); }
 void wbx_stop_guest(mb_host *obj, const char *why, mb_return *ret) { ok(ret, (uintptr_t)mb_host_stop(obj, why)); }
 void wbx_stop_cancel(mb_host *obj, mb_return *ret) { mb_host_stop_cancel(obj); ok(ret, 0); }
+void wbx_set_parallel_workers(int workers, mb_return *ret) { mb_parallel_set_workers(workers); ok(ret, (uintptr_t)mb_parallel_workers()); }
 uint64_t mb_host_activity(mb_host *h);
 void wbx_guest_activity(mb_host *obj, mb_return *ret) { ok(ret, (uintptr_t)mb_host_activity(obj)); }
 void mb_host_count_work_from(mb_host *h, const uint64_t *counter);

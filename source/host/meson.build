@@ -20,6 +20,7 @@ minibox_host_sources = files(
   'fs.c',
   'host.c',
   'threading.c',
+  'parallel.c',
   'cinterface.c',
   'calling_convention_adapters.c',
 )

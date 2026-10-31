@@ -154,6 +154,13 @@ void wbx_get_death(mb_host *obj, char *out, uintptr_t cap, mb_return *ret);
 void wbx_stop_from_here(mb_host *obj, mb_return *ret);
 void wbx_stop_guest(mb_host *obj, const char *why, mb_return *ret);
 void wbx_stop_cancel(mb_host *obj, mb_return *ret);
+/* Run in parallel, then join (system call 2001, parallel.c): how many host
+ * worker threads a guest's parallel calls may use, for every machine in the
+ * process. 0 turns the feature off and the guest runs its tasks itself, which
+ * gives the same machine. Without this call, MB_PARALLEL_WORKERS is read.
+ * Linux only; ret->data is the count in force. The pool is made at the first
+ * parallel call, at the count in force then; set it before that. */
+void wbx_set_parallel_workers(int workers, mb_return *ret);
 /* A count of the guest's system calls, leaving out those a waiting or polling
  * loop makes (yields, sleeps, clock reads, futexes, thread ids): safe to read
  * from any thread. A watchdog that sees it move knows the guest is working -

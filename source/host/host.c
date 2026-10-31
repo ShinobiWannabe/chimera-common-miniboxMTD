@@ -77,7 +77,7 @@ enum {
 	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_setaffinity=203, NR_sched_getaffinity=204, NR_pread64=17, NR_pwrite64=18, NR_socket=41, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72,
 	NR_fsync=74, NR_fdatasync=75, NR_sync=162, NR_syncfs=306,
-	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000,
+	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000, NR_wbx_parallel_for=2001,
 	NR_getrusage=98,
 	NR_tkill=200, NR_exit_group=231, NR_tgkill=234,
 	NR_readlink=89, NR_readlinkat=267, NR_pipe=22, NR_pipe2=293,
@@ -300,6 +300,12 @@ bool mb_host_guest_death_in_handler(mb_context *c, const char *fmt, ...) {
 	const bool escapable = record_death(c, false, fmt, ap);
 	va_end(ap);
 	return escapable;
+}
+
+/* why a machine died, as wbx_get_death says it ("" while none did) */
+const char *mb_host_death_text(const mb_context *c) {
+	const mb_host *h = c != NULL ? (const mb_host *)c->host_ptr : NULL;
+	return h != NULL ? h->death : "";
 }
 
 const char *mb_host_stop_reason(const mb_context *c) {
@@ -898,6 +904,13 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 				*(int64_t *)a4 = 0; *((int64_t *)a4 + 1) = 0;
 			}
 			return mb_threads_yield(h->threads, &h->context);
+		}
+		case NR_wbx_parallel_for: {
+			/* (fn, arg, n): fn(arg, i) for every i below n, on the host's
+			 * worker threads, returning when all are done (parallel.c). Off,
+			 * it answers ENOSYS and the guest runs the loop itself. */
+			mb_sword r = mb_parallel_for(&h->context, a1, a2, a3);
+			return r < 0 ? serr((int)-r) : sok(r);
 		}
 		case NR_wbx_clone: {
 			/* args: (tls/thread_area, child_rsp, child_rip, child_tid, parent_tid*):
