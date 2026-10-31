@@ -3,8 +3,9 @@
  *     wbx_parallel_for(fn, arg, n);
  *
  * calls fn(arg, i) once for every i from 0 to n-1 and returns when all of them
- * have returned. When the host has worker threads (MACHINE-SPEC, "Parallel
- * tasks") they run on those; otherwise the loop runs right here, in order. The
+ * have returned. The host runs them (MACHINE-SPEC, "Parallel tasks"), on its
+ * worker threads and the calling one; a host without the call answers no and
+ * the loop runs right here, in order. The
  * machine comes out the same either way, PROVIDED the tasks keep the rules:
  *
  *   - a task writes only memory no other task of the same call reads or writes;
@@ -34,7 +35,9 @@ static inline void wbx_parallel_for(wbx_parallel_task fn, void *arg, uint32_t n)
 	/* errno is part of the machine: a refusal (the feature off) must leave
 	 * it as it found it, or "off" and "on" are two different machines */
 	const int saved = errno;
-	const long r = n > 1 ? syscall(WBX_NR_PARALLEL_FOR, fn, arg, (unsigned long)n) : -1;
+	/* even one task goes to the host: it runs tasks on stacks of its own,
+	 * so whether a task ran leaves nothing on the guest's stack */
+	const long r = syscall(WBX_NR_PARALLEL_FOR, fn, arg, (unsigned long)n);
 	errno = saved;
 	if (r == 0) return;
 	for (uint32_t i = 0; i < n; i++) fn(arg, i);

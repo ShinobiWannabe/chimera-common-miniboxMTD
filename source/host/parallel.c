@@ -30,12 +30,18 @@
  *   - a task that dies (a fault, a system call) ends its worker's share; after
  *     the join the machine dies as it would have on the main thread.
  *
- * Off unless asked for: with no workers (MB_PARALLEL_WORKERS unset or 0, or
- * wbx_set_parallel_workers(0)) the call answers -ENOSYS and the guest runs
- * the loop itself, which is the reference every test compares against. Linux
- * only for now; Windows answers -ENOSYS the same way. A guest that keeps its own
- * %fs (fs_swap) is refused too, for the same answer: the fault handler would
- * read this file's thread locals through the guest's %fs. */
+ * The thread that asked takes tasks too, through a context of its own with a
+ * host stack, like a worker's. With no workers (MB_PARALLEL_WORKERS unset or 0,
+ * or wbx_set_parallel_workers(0)) it runs every task itself, in order. Either
+ * way no task ever runs on the guest's own stack, so the machine's memory is
+ * the same whatever the number of workers: a guest stack the tasks had run on
+ * would hold their leftovers, and only in some configurations.
+ *
+ * Linux only for now; Windows answers -ENOSYS, and the guest then runs the
+ * loop itself (a machine whose stack differs from Linux's, below the stack
+ * pointer). A guest that keeps its own %fs (fs_swap) is refused the same way:
+ * the fault handler would read this file's thread locals through the guest's
+ * %fs. */
 #ifndef _WIN32
 #define _GNU_SOURCE
 #endif
@@ -93,9 +99,11 @@ typedef struct {
 static struct {
 	pthread_mutex_t lock;
 	pthread_cond_t go, done_cv;
-	int requested;           /* how many workers to use (0: the feature is off) */
+	int requested;           /* how many workers to use besides the caller */
 	int started;             /* how many exist */
 	worker w[MB_PARALLEL_MAX];
+	worker caller;           /* the asking thread's own, for its share */
+	bool caller_ready;
 	/* the current call */
 	volatile uint64_t generation;
 	uintptr_t fn, arg;
@@ -181,24 +189,44 @@ bool mb_parallel_running(void) { return P.running; }
 /* For the fault handler: the worker context a thread's gs slot names, or NULL. */
 mb_context *mb_parallel_ctx_of_slot(uintptr_t slot) {
 	if (slot == 0 || !P.running) return NULL;
+	if (slot == (uintptr_t)&P.caller.ctx) return &P.caller.ctx;
 	for (int i = 0; i < P.started; i++)
 		if (slot == (uintptr_t)&P.w[i].ctx) return &P.w[i].ctx;
 	return NULL;
+}
+
+static bool map_stack(worker *w) {
+	mb_range in = { 0, WORKER_STACK }, got;
+	if (mb_pal_map_anon(in, MB_PROT_RW, &got) != 0) return false;
+	mb_range guard = { got.start, MB_PAGESIZE };
+	mb_pal_protect(guard, MB_PROT_NONE);
+	w->stack = got;
+	return true;
+}
+
+static void prepare(worker *w, mb_context *main) {
+	mb_context *c = &w->ctx;
+	/* the stack top, 16-aligned, minus the slot a return address takes */
+	mb_context_init(c, mb_range_end(w->stack) - 16, 0, worker_syscall);
+	c->host_ptr = main->host_ptr;
+	c->thread_area = main->thread_area;
+	c->fs_swap = false;
+	/* the guest's control words as they are now (the system call that
+	 * brought us here kept them in the main context) */
+	c->guest_fcw = main->guest_fcw;
+	c->guest_mxcsr = main->guest_mxcsr;
+	w->failed = 0;
 }
 
 static bool start_workers(int want) {
 	while (P.started < want) {
 		worker *w = &P.w[P.started];
 		memset(w, 0, sizeof *w);
-		mb_range in = { 0, WORKER_STACK }, got;
-		if (mb_pal_map_anon(in, MB_PROT_RW, &got) != 0) return false;
-		mb_range guard = { got.start, MB_PAGESIZE };
-		mb_pal_protect(guard, MB_PROT_NONE);
-		w->stack = got;
+		if (!map_stack(w)) return false;
 		/* a worker that is being created must not see a generation it
 		 * should not run: it starts from the current one */
 		if (pthread_create(&w->thread, NULL, worker_main, w) != 0) {
-			mb_pal_unmap_anon(got);
+			mb_pal_unmap_anon(w->stack);
 			return false;
 		}
 		P.started++;
@@ -208,37 +236,43 @@ static bool start_workers(int want) {
 
 mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_t n) {
 	const int want = mb_parallel_workers();
-	if (want < 1 || main->fs_swap) return -ENOSYS;
+	if (main->fs_swap) return -ENOSYS;
 	if (n == 0) return 0;
 	if (n > 0xffffffffu) return -EINVAL;
+	if (!P.caller_ready) {
+		if (!map_stack(&P.caller)) return -ENOSYS;
+		P.caller_ready = true;
+	}
 	/* the pool is made the first time, at the size asked for then; a later
 	 * change of the count takes a new process (every worker takes part in
 	 * every call, so the pool cannot shrink under a running machine) */
-	if (P.started == 0 && !start_workers(want)) return -ENOSYS;
-	for (int i = 0; i < P.started; i++) {
-		worker *w = &P.w[i];
-		mb_context *c = &w->ctx;
-		/* the stack top, 16-aligned, minus the slot a return address takes */
-		mb_context_init(c, mb_range_end(w->stack) - 16, 0, worker_syscall);
-		c->host_ptr = main->host_ptr;
-		c->thread_area = main->thread_area;
-		c->fs_swap = false;
-		/* the guest's control words as they are now (the system call that
-		 * brought us here kept them in the main context) */
-		c->guest_fcw = main->guest_fcw;
-		c->guest_mxcsr = main->guest_mxcsr;
-		w->failed = 0;
-	}
+	if (want > 0 && P.started == 0 && !start_workers(want)) return -ENOSYS;
+	for (int i = 0; i < P.started; i++) prepare(&P.w[i], main);
+	prepare(&P.caller, main);
 	P.fn = fn;
 	P.arg = arg;
 	P.n = (uint32_t)n;
 	__atomic_store_n(&P.next, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&P.finished, 0, __ATOMIC_RELAXED);
 	P.running = true;
-	pthread_mutex_lock(&P.lock);
-	__atomic_add_fetch(&P.generation, 1, __ATOMIC_ACQ_REL);
-	pthread_cond_broadcast(&P.go);
-	pthread_mutex_unlock(&P.lock);
+	if (P.started > 0) {
+		pthread_mutex_lock(&P.lock);
+		__atomic_add_fetch(&P.generation, 1, __ATOMIC_ACQ_REL);
+		pthread_cond_broadcast(&P.go);
+		pthread_mutex_unlock(&P.lock);
+	}
+	/* the caller's share, through its own context and stack */
+	t_worker_ctx = &P.caller.ctx;
+	for (;;) {
+		const uint32_t i = __atomic_fetch_add(&P.next, 1, __ATOMIC_ACQ_REL);
+		if (i >= P.n) break;
+		mb_parallel_enter(&P.caller.ctx, fn, arg, i);
+		if (P.caller.ctx.dead) {
+			P.caller.failed = 1;
+			break;
+		}
+	}
+	t_worker_ctx = NULL;
 	/* wait: spin first, for the same reason the workers do */
 	int spins = 0;
 	while (__atomic_load_n(&P.finished, __ATOMIC_ACQUIRE) != P.started && spins < 200000) {
@@ -252,6 +286,11 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 		pthread_mutex_unlock(&P.lock);
 	}
 	P.running = false;
+	if (P.caller.failed) {
+		char why[512];
+		snprintf(why, sizeof why, "%s", mb_host_death_text(main));
+		mb_host_guest_death(main, "a task run in parallel died: %s", why);
+	}
 	for (int i = 0; i < P.started; i++)
 		if (P.w[i].failed) {
 			/* the worker's death said why; the machine's death says it again,
