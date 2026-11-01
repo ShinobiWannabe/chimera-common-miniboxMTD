@@ -256,7 +256,7 @@ void mb_parallel_set_workers(int n) {
 int mb_parallel_workers(void) {
 	if (P.requested < 0) {
 		const char *e = getenv("MB_PARALLEL_WORKERS");
-		int n = e ? atoi(e) : 0;
+		int n = e && e[0] ? atoi(e) : host_cores() - 1;
 		mb_parallel_set_workers(n);
 	}
 	return P.requested;
