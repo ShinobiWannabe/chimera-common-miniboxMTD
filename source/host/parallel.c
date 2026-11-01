@@ -37,11 +37,11 @@
  * the same whatever the number of workers: a guest stack the tasks had run on
  * would hold their leftovers, and only in some configurations.
  *
- * Linux only for now; Windows answers -ENOSYS, and the guest then runs the
- * loop itself (a machine whose stack differs from Linux's, below the stack
- * pointer). A guest that keeps its own %fs (fs_swap) is refused the same way:
- * the fault handler would read this file's thread locals through the guest's
- * %fs. */
+ * Linux and Windows alike: the threads, locks and the way into the guest are
+ * the platform's (below), the rest is the same code, so the machine is the
+ * same on both. A guest that keeps its own %fs (fs_swap) is refused with
+ * -ENOSYS, and runs the loop itself: on Linux the fault handler would read
+ * this file's thread locals through the guest's %fs. */
 #ifndef _WIN32
 #define _GNU_SOURCE
 #endif
@@ -54,25 +54,81 @@
 #define MB_PARALLEL_MAX 64
 
 #ifdef _WIN32
-
-int mb_parallel_workers(void) { return 0; }
-void mb_parallel_set_workers(int n) { (void)n; }
-mb_context *mb_parallel_ctx_of_slot(uintptr_t slot) { (void)slot; return NULL; }
-bool mb_parallel_running(void) { return false; }
-mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_t n) {
-	(void)main; (void)fn; (void)arg; (void)n;
-	return -ENOSYS;
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+typedef HANDLE mb_pthread;
+typedef SRWLOCK mb_lock;
+typedef CONDITION_VARIABLE mb_cond;
+#define LOCK_STATIC SRWLOCK_INIT
+#define COND_STATIC CONDITION_VARIABLE_INIT
+#define LOCK_INIT(l) InitializeSRWLock(l)
+#define COND_INIT(c) InitializeConditionVariable(c)
+#define LOCK(l) AcquireSRWLockExclusive(l)
+#define UNLOCK(l) ReleaseSRWLockExclusive(l)
+#define WAIT(c, l) SleepConditionVariableSRW((c), (l), INFINITE, 0)
+#define SIGNAL(c) WakeConditionVariable(c)
+static long host_cores(void) { return (long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); }
+static DWORD WINAPI worker_entry(LPVOID arg);
+/* the worker's own host stack only holds worker_main's frame: tasks run on
+ * the stacks mapped below */
+static bool thread_start(mb_pthread *t, void *arg) {
+	*t = CreateThread(NULL, 256 << 10, worker_entry, arg, 0, NULL);
+	return *t != NULL;
 }
-
 #else
-
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
+typedef pthread_t mb_pthread;
+typedef pthread_mutex_t mb_lock;
+typedef pthread_cond_t mb_cond;
+#define LOCK_STATIC PTHREAD_MUTEX_INITIALIZER
+#define COND_STATIC PTHREAD_COND_INITIALIZER
+#define LOCK_INIT(l) pthread_mutex_init((l), NULL)
+#define COND_INIT(c) pthread_cond_init((c), NULL)
+#define LOCK(l) pthread_mutex_lock(l)
+#define UNLOCK(l) pthread_mutex_unlock(l)
+#define WAIT(c, l) pthread_cond_wait((c), (l))
+#define SIGNAL(c) pthread_cond_signal(c)
+static long host_cores(void) { return sysconf(_SC_NPROCESSORS_ONLN); }
+static void *worker_entry(void *arg);
+static bool thread_start(mb_pthread *t, void *arg) {
+	return pthread_create(t, NULL, worker_entry, arg) == 0;
+}
+#endif
 
 /* jumps into guarded.S with r10 = context, r11 = the guest function, and the
  * task's two arguments in rdi and rsi, exactly as an export thunk does */
 uintptr_t mb_parallel_enter(mb_context *c, uintptr_t fn, uintptr_t arg, uintptr_t i);
+#ifdef _WIN32
+/* win64 brings the arguments in rcx, rdx, r8 and r9, and wants rdi and rsi
+ * kept: they are saved here, before they carry the task's arguments (the
+ * guarded call's own saves would see the arguments) */
+__asm__(
+	".text\n"
+	".p2align 4\n"
+	".globl mb_parallel_enter\n"
+	".def mb_parallel_enter; .scl 2; .type 32; .endef\n"
+	"mb_parallel_enter:\n"
+	".seh_proc mb_parallel_enter\n"
+	"	pushq %rdi\n"
+	".seh_pushreg %rdi\n"
+	"	pushq %rsi\n"
+	".seh_pushreg %rsi\n"
+	"	subq $8, %rsp\n"
+	".seh_stackalloc 8\n"
+	".seh_endprologue\n"
+	"	movq %rcx, %r10\n"
+	"	movq %rdx, %r11\n"
+	"	movq %r8, %rdi\n"
+	"	movq %r9, %rsi\n"
+	"	call mb_guarded_call\n"
+	"	addq $8, %rsp\n"
+	"	popq %rsi\n"
+	"	popq %rdi\n"
+	"	ret\n"
+	".seh_endproc\n");
+#else
 __asm__(
 	".text\n"
 	".p2align 4\n"
@@ -86,23 +142,24 @@ __asm__(
 	"	movq %rcx, %rsi\n"
 	"	jmp mb_guarded_call\n"
 	".size mb_parallel_enter, .-mb_parallel_enter\n");
+#endif
 
 #define WORKER_STACK (2u << 20)
 
 typedef struct {
-	pthread_t thread;
+	mb_pthread thread;
 	mb_context ctx;
 	mb_range stack;          /* host memory, with a guard page at the bottom */
 	volatile int failed;
 	/* where this worker sleeps: a call wakes only the workers it needs, so
 	 * the rest of a large pool costs nothing */
-	pthread_mutex_t lock;
-	pthread_cond_t go;
+	mb_lock lock;
+	mb_cond go;
 } worker;
 
 static struct {
-	pthread_mutex_t lock;
-	pthread_cond_t done_cv;
+	mb_lock lock;
+	mb_cond done_cv;
 	int requested;           /* how many workers to use besides the caller */
 	int started;             /* how many exist */
 	worker w[MB_PARALLEL_MAX];
@@ -115,7 +172,7 @@ static struct {
 	volatile uint32_t next;  /* the next task index to hand out */
 	volatile int finished;   /* workers done with this generation */
 	volatile bool running;
-} P = { .lock = PTHREAD_MUTEX_INITIALIZER, .done_cv = PTHREAD_COND_INITIALIZER, .requested = -1 };
+} P = { .lock = LOCK_STATIC, .done_cv = COND_STATIC, .requested = -1 };
 
 /* the worker this thread is (host C only: guest code never runs with a %fs this
  * file could read through, since fs_swap guests are refused) */
@@ -151,9 +208,9 @@ static void *worker_main(void *arg) {
 			spins++;
 		}
 		if (__atomic_load_n(&P.generation, __ATOMIC_ACQUIRE) == seen) {
-			pthread_mutex_lock(&me->lock);
-			while (__atomic_load_n(&P.generation, __ATOMIC_ACQUIRE) == seen) pthread_cond_wait(&me->go, &me->lock);
-			pthread_mutex_unlock(&me->lock);
+			LOCK(&me->lock);
+			while (__atomic_load_n(&P.generation, __ATOMIC_ACQUIRE) == seen) WAIT(&me->go, &me->lock);
+			UNLOCK(&me->lock);
 		}
 		/* the generation names the workers it needs, in one word: a worker
 		 * that sat out an earlier call may wake late, and must not mistake
@@ -176,13 +233,19 @@ static void *worker_main(void *arg) {
 			}
 		}
 		if (__atomic_add_fetch(&P.finished, 1, __ATOMIC_ACQ_REL) == active) {
-			pthread_mutex_lock(&P.lock);
-			pthread_cond_signal(&P.done_cv);
-			pthread_mutex_unlock(&P.lock);
+			LOCK(&P.lock);
+			SIGNAL(&P.done_cv);
+			UNLOCK(&P.lock);
 		}
 	}
 	return NULL;
 }
+
+#ifdef _WIN32
+static DWORD WINAPI worker_entry(LPVOID arg) { worker_main(arg); return 0; }
+#else
+static void *worker_entry(void *arg) { return worker_main(arg); }
+#endif
 
 void mb_parallel_set_workers(int n) {
 	if (n < 0) n = 0;
@@ -238,11 +301,11 @@ static bool start_workers(int want) {
 		worker *w = &P.w[P.started];
 		memset(w, 0, sizeof *w);
 		if (!map_stack(w)) return false;
-		pthread_mutex_init(&w->lock, NULL);
-		pthread_cond_init(&w->go, NULL);
+		LOCK_INIT(&w->lock);
+		COND_INIT(&w->go);
 		/* a worker that is being created must not see a generation it
 		 * should not run: it starts from the current one */
-		if (pthread_create(&w->thread, NULL, worker_main, w) != 0) {
+		if (!thread_start(&w->thread, w)) {
 			mb_pal_unmap_anon(w->stack);
 			return false;
 		}
@@ -256,7 +319,7 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 	/* a worker more than the host has cores only waits for its turn while
 	 * the others spin waiting for it (which thread runs a task never
 	 * matters, so this is the same machine) */
-	const long cores = sysconf(_SC_NPROCESSORS_ONLN);
+	const long cores = host_cores();
 	if (cores > 0 && want > cores - 1) want = (int)(cores - 1);
 	if (main->fs_swap) return -ENOSYS;
 	if (n == 0) return 0;
@@ -287,9 +350,9 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 		/* wake the ones taking part; the others may wake later on their own,
 		 * see they are not needed, and sleep again */
 		for (int i = 0; i < active; i++) {
-			pthread_mutex_lock(&P.w[i].lock);
-			pthread_cond_signal(&P.w[i].go);
-			pthread_mutex_unlock(&P.w[i].lock);
+			LOCK(&P.w[i].lock);
+			SIGNAL(&P.w[i].go);
+			UNLOCK(&P.w[i].lock);
 		}
 	}
 	/* the caller's share, through its own context and stack */
@@ -311,10 +374,10 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 		spins++;
 	}
 	if (__atomic_load_n(&P.finished, __ATOMIC_ACQUIRE) != active) {
-		pthread_mutex_lock(&P.lock);
+		LOCK(&P.lock);
 		while (__atomic_load_n(&P.finished, __ATOMIC_ACQUIRE) != active)
-			pthread_cond_wait(&P.done_cv, &P.lock);
-		pthread_mutex_unlock(&P.lock);
+			WAIT(&P.done_cv, &P.lock);
+		UNLOCK(&P.lock);
 	}
 	P.running = false;
 	if (P.caller.failed) {
@@ -332,5 +395,3 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 		}
 	return 0;
 }
-
-#endif

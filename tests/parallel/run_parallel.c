@@ -56,11 +56,22 @@ static mb_host *load(const char *path) {
 	return h;
 }
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+static double now_ms(void) {
+	LARGE_INTEGER f, c;
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&c);
+	return (double)c.QuadPart * 1e3 / (double)f.QuadPart;
+}
+#else
 static double now_ms(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
+#endif
 
 static int child(const char *path, int workers) {
 	mb_return r;
@@ -110,8 +121,14 @@ int main(int argc, char **argv) {
 	int fails = 0;
 	for (size_t i = 0; i < sizeof counts / sizeof counts[0]; i++) {
 		char cmd[4096];
+#ifdef _WIN32
+		/* cmd.exe drops the outer quotes, so the whole line gets a pair */
+		snprintf(cmd, sizeof cmd, "\"\"%s\" \"%s\" --child %d\"", argv[0], path, counts[i]);
+		FILE *p = _popen(cmd, "r");
+#else
 		snprintf(cmd, sizeof cmd, "'%s' '%s' --child %d", argv[0], path, counts[i]);
 		FILE *p = popen(cmd, "r");
+#endif
 		if (!p) { fprintf(stderr, "cannot run %s\n", cmd); return 1; }
 		char line[1024];
 		int saw_result = 0, deaths = 0;
@@ -142,7 +159,11 @@ int main(int argc, char **argv) {
 				}
 			}
 		}
+#ifdef _WIN32
+		const int status = _pclose(p);
+#else
 		const int status = pclose(p);
+#endif
 		if (status != 0 || !saw_result) { printf("  FAIL: %d workers: the run did not finish (status %d)\n", counts[i], status); fails++; }
 		if (counts[i] >= 2 && deaths != 2) { printf("  FAIL: %d workers: %d of 2 rule tests ran\n", counts[i], deaths); fails++; }
 	}
