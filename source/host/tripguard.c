@@ -1359,6 +1359,9 @@ __asm__(".text\n\t.p2align 4\nmb_stop_trap:\n\tud2\n");
  * the next ask. 1 when it was sent. */
 int mb_tripguard_stop_thread(void *thread) {
 	HANDLE t = (HANDLE)thread;
+	/* during a parallel call the thread runs a task, on a context of its own, and
+	 * the other workers run with it: the stop waits for the system call after the join */
+	if (mb_parallel_running()) return 0;
 	if (SuspendThread(t) == (DWORD)-1) return 0;
 	CONTEXT c;
 	memset(&c, 0, sizeof c);
@@ -1564,6 +1567,9 @@ static bool commit_on_fault(uintptr_t addr, bool write, bool *oom) {
 static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t fault) {
 	bool oom = false;
 	if (commit_on_fault(fault, write, &oom)) return EXCEPTION_CONTINUE_EXECUTION;
+	/* during a parallel call, a read that raced another task's deferred commit: the page
+	 * is there now, and the read only has to run again */
+	if (!oom && ep->ExceptionRecord->ExceptionInformation[0] == 0 /* a read, not a fetch */ && mb_parallel_running() && owner_of(fault) && mb_page_readable(fault)) return EXCEPTION_CONTINUE_EXECUTION;
 	/* refused again: nothing else can serve a page with no memory behind it -
 	 * dirty tracking would protect it and trap on the refusal - so it is
 	 * reported, as the host being out of memory */
