@@ -43,4 +43,39 @@ static inline void wbx_parallel_for(wbx_parallel_task fn, void *arg, uint32_t n)
 	for (uint32_t i = 0; i < n; i++) fn(arg, i);
 }
 
+
+/* Begin, then join later:
+ *
+ *     wbx_parallel_begin(fn, arg, n);
+ *     ... the guest goes on ...
+ *     wbx_parallel_join();
+ *
+ * runs the same tasks as wbx_parallel_for, with the same rules, but returns
+ * at once: the host's workers run them while the guest's own thread goes on,
+ * and wbx_parallel_join returns when all have finished (the calling thread
+ * takes any left over). One begun call at a time; a second begin, a
+ * wbx_parallel_for, or ANY other system call joins the one running first.
+ * Between the two the guest must not read or write memory the tasks write,
+ * nor write memory they read: that is the guest's to keep, and the same test
+ * finds a mistake (1 worker against several). With no workers every task runs
+ * inside begin; a host without the calls answers no and the loop runs right
+ * here, in order. */
+#define WBX_NR_PARALLEL_BEGIN 2002
+#define WBX_NR_PARALLEL_JOIN 2003
+
+static inline void wbx_parallel_begin(wbx_parallel_task fn, void *arg, uint32_t n) {
+	if (n == 0) return;
+	const int saved = errno;
+	const long r = syscall(WBX_NR_PARALLEL_BEGIN, fn, arg, (unsigned long)n);
+	errno = saved;
+	if (r == 0) return;
+	for (uint32_t i = 0; i < n; i++) fn(arg, i);
+}
+
+static inline void wbx_parallel_join(void) {
+	const int saved = errno;
+	(void)syscall(WBX_NR_PARALLEL_JOIN);
+	errno = saved;
+}
+
 #endif

@@ -94,6 +94,19 @@ static int child(const char *path, int workers) {
 
 	wbx_deactivate_host(h, &r);
 	wbx_destroy_host(h, &r);   /* one machine at a time in a process: the death tests make their own */
+	/* begin and join: the same picture as the calls above, and one machine */
+	{
+		mb_host *a = load(path);
+		const uint64_t mixed = ((run3_fn)proc(a, "RunFramesAsync"))(30, 40, 3);
+		const uint64_t apic = ((run0_fn)proc(a, "PictureOnly"))();
+		hash_t ast = { 1469598103934665603ull, 0 };
+		wbx_save_state(a, hash_write, (uintptr_t)&ast, &r);
+		printf("ASYNC %d picture=%016llx mixed=%016llx state=%016llx/%llu same_picture=%d\n", workers,
+		       (unsigned long long)apic, (unsigned long long)mixed, (unsigned long long)ast.h,
+		       (unsigned long long)ast.len, apic == pic);
+		wbx_deactivate_host(a, &r);
+		wbx_destroy_host(a, &r);
+	}
 	if (workers >= 2) {
 		/* the rules: a task's system call and a task's fault each end the
 		 * machine, not the process */
@@ -117,7 +130,7 @@ int main(int argc, char **argv) {
 	if (argc > 3 && strcmp(argv[2], "--child") == 0) return child(path, atoi(argv[3]));
 
 	const int counts[] = { 0, 1, 2, 4, 8 };
-	char first[200] = "";
+	char first[200] = "", first_async[300] = "";
 	int fails = 0;
 	for (size_t i = 0; i < sizeof counts / sizeof counts[0]; i++) {
 		char cmd[4096];
@@ -131,7 +144,7 @@ int main(int argc, char **argv) {
 #endif
 		if (!p) { fprintf(stderr, "cannot run %s\n", cmd); return 1; }
 		char line[1024];
-		int saw_result = 0, deaths = 0;
+		int saw_result = 0, deaths = 0, saw_async = 0;
 		while (fgets(line, sizeof line, p)) {
 			fputs(line, stdout);
 			if (strncmp(line, "RESULT ", 7) == 0) {
@@ -151,6 +164,21 @@ int main(int argc, char **argv) {
 					fails++;
 				}
 			}
+			if (strncmp(line, "ASYNC ", 6) == 0) {
+				saw_async = 1;
+				if (!strstr(line, "same_picture=1")) {
+					printf("  FAIL: begin and join drew a different picture from wbx_parallel_for\n");
+					fails++;
+				}
+				const char *k = strstr(line, "picture=");
+				if (k) {
+					if (first_async[0] == '\0') snprintf(first_async, sizeof first_async, "%s", k);
+					else if (strcmp(first_async, k) != 0) {
+						printf("  FAIL: begin and join made a different machine with %d workers\n", counts[i]);
+						fails++;
+					}
+				}
+			}
 			if (strncmp(line, "DEATH ", 6) == 0) {
 				deaths++;
 				if (!strstr(line, "ret=0 ") || !strstr(line, "died=1")) {
@@ -165,6 +193,7 @@ int main(int argc, char **argv) {
 		const int status = pclose(p);
 #endif
 		if (status != 0 || !saw_result) { printf("  FAIL: %d workers: the run did not finish (status %d)\n", counts[i], status); fails++; }
+		if (!saw_async) { printf("  FAIL: %d workers: the begin and join run did not finish\n", counts[i]); fails++; }
 		if (counts[i] >= 2 && deaths != 2) { printf("  FAIL: %d workers: %d of 2 rule tests ran\n", counts[i], deaths); fails++; }
 	}
 	printf(fails ? "parallel: %d FAILED\n" : "parallel: every worker count made the same machine\n", fails);

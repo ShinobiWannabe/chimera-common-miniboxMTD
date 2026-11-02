@@ -640,6 +640,11 @@ void      mb_prepare_thread(void);              /* install gs base once per host
 void      mb_prepare_worker_thread(void);       /* a parallel worker: its own gs base, always */
 /* parallel.c: run in parallel, then join (system call 2001) */
 mb_sword    mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_t n);
+/* begin (2002) and join (2003): the same tasks, while the guest's thread goes on */
+mb_sword    mb_parallel_begin(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_t n);
+mb_sword    mb_parallel_join(mb_context *main);
+bool        mb_parallel_async(void);
+void        mb_parallel_quiesce(void);
 int         mb_parallel_workers(void);
 void        mb_parallel_set_workers(int n);
 bool        mb_parallel_running(void);

@@ -172,6 +172,11 @@ static struct {
 	volatile uint32_t next;  /* the next task index to hand out */
 	volatile int finished;   /* workers done with this generation */
 	volatile bool running;
+	/* a call begun and not yet joined (wbx_parallel_begin, 2002): the
+	 * workers run its tasks while the guest's own thread goes on */
+	bool async;
+	int async_active;        /* workers taking part */
+	mb_context *async_main;  /* the context that began it */
 } P = { .lock = LOCK_STATIC, .done_cv = COND_STATIC, .requested = -1 };
 
 /* the worker this thread is (host C only: guest code never runs with a %fs this
@@ -314,7 +319,11 @@ static bool start_workers(int want) {
 	return true;
 }
 
-mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_t n) {
+/* Makes the pool ready and hands the tasks out. With `caller_takes` the
+ * calling thread counts as one more taker, so the workers are one fewer than
+ * the tasks; without, as for a begun call, the workers may take them all.
+ * Returns how many workers take part, or a negative error. */
+static int start_call(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_t n, bool caller_takes) {
 	int want = mb_parallel_workers();
 	/* a worker more than the host has cores only waits for its turn while
 	 * the others spin waiting for it (which thread runs a task never
@@ -322,7 +331,6 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 	const long cores = host_cores();
 	if (cores > 0 && want > cores - 1) want = (int)(cores - 1);
 	if (main->fs_swap) return -ENOSYS;
-	if (n == 0) return 0;
 	if (n > 0xffffffffu) return -EINVAL;
 	if (!P.caller_ready) {
 		if (!map_stack(&P.caller)) return -ENOSYS;
@@ -335,7 +343,8 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 	 * stay asleep (which thread runs a task never matters, so this is the
 	 * same machine) */
 	int active = P.started;
-	if ((uintptr_t)active > n - 1) active = (int)(n - 1);
+	const uintptr_t others = caller_takes ? n - 1 : n;
+	if ((uintptr_t)active > others) active = (int)others;
 	for (int i = 0; i < active; i++) prepare(&P.w[i], main);
 	prepare(&P.caller, main);
 	P.fn = fn;
@@ -355,19 +364,28 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 			UNLOCK(&P.w[i].lock);
 		}
 	}
-	/* the caller's share, through its own context and stack */
+	return active;
+}
+
+/* The calling thread takes whatever tasks are left, through its own context
+ * and stack. */
+static void caller_share(void) {
 	t_worker_ctx = &P.caller.ctx;
 	for (;;) {
 		const uint32_t i = __atomic_fetch_add(&P.next, 1, __ATOMIC_ACQ_REL);
 		if (i >= P.n) break;
-		mb_parallel_enter(&P.caller.ctx, fn, arg, i);
+		mb_parallel_enter(&P.caller.ctx, P.fn, P.arg, i);
 		if (P.caller.ctx.dead) {
 			P.caller.failed = 1;
 			break;
 		}
 	}
 	t_worker_ctx = NULL;
-	/* wait: spin first, for the same reason the workers do */
+}
+
+/* Waits for the `active` workers to finish the call. */
+static void wait_workers(int active) {
+	/* spin first, for the same reason the workers do */
 	int spins = 0;
 	while (__atomic_load_n(&P.finished, __ATOMIC_ACQUIRE) != active && spins < 200000) {
 		__builtin_ia32_pause();
@@ -380,6 +398,11 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 		UNLOCK(&P.lock);
 	}
 	P.running = false;
+}
+
+/* After the join: a task that died ends the machine, as a crash on the main
+ * thread would. */
+static void report_deaths(mb_context *main, int active) {
 	if (P.caller.failed) {
 		char why[512];
 		snprintf(why, sizeof why, "%s", mb_host_death_text(main));
@@ -393,5 +416,57 @@ mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_
 			snprintf(why, sizeof why, "%s", mb_host_death_text(main));
 			mb_host_guest_death(main, "a task run in parallel died: %s", why);
 		}
+}
+
+/* A begun call's tasks all finished, with nothing reported yet: for a death
+ * on the guest's own thread, which must not leave workers inside a machine
+ * that is about to be unwound. */
+void mb_parallel_quiesce(void) {
+	/* not from a task: a worker that dies waits for no one */
+	if (!P.async || t_worker_ctx != NULL) return;
+	wait_workers(P.async_active);
+	P.async = false;
+}
+
+bool mb_parallel_async(void) { return P.async; }
+
+mb_sword mb_parallel_join(mb_context *main) {
+	if (!P.async) return 0;
+	(void)main;
+	caller_share();
+	wait_workers(P.async_active);
+	P.async = false;
+	report_deaths(P.async_main, P.async_active);
+	return 0;
+}
+
+mb_sword mb_parallel_begin(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_t n) {
+	/* one begun call at a time: a second one joins the first */
+	if (P.async) mb_parallel_join(main);
+	if (n == 0) return 0;
+	const int active = start_call(main, fn, arg, n, false);
+	if (active < 0) return active;
+	if (active == 0) {
+		/* no workers: the calling thread runs every task now, on its own
+		 * stack as always, and the join finds nothing to wait for */
+		caller_share();
+		P.running = false;
+		report_deaths(main, 0);
+		return 0;
+	}
+	P.async = true;
+	P.async_active = active;
+	P.async_main = main;
+	return 0;
+}
+
+mb_sword mb_parallel_for(mb_context *main, uintptr_t fn, uintptr_t arg, uintptr_t n) {
+	if (P.async) mb_parallel_join(main);
+	if (n == 0) return 0;
+	const int active = start_call(main, fn, arg, n, true);
+	if (active < 0) return active;
+	caller_share();
+	wait_workers(active);
+	report_deaths(main, active);
 	return 0;
 }

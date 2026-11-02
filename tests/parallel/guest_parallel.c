@@ -62,6 +62,31 @@ ECL_EXPORT uint64_t RunFrames(uint32_t frames, uint32_t calls, uint32_t work) {
 	return checksum();
 }
 
+/* The same frames with wbx_parallel_begin and wbx_parallel_join: while the
+ * tasks draw, the guest's own thread works on memory of its own, and now and
+ * then makes a system call, which joins the call early. The picture must be
+ * RunFrames' picture, and the whole machine the same for every worker count. */
+static uint32_t g_side[4096];
+
+ECL_EXPORT uint64_t RunFramesAsync(uint32_t frames, uint32_t calls, uint32_t work) {
+	static job j;   /* read by the tasks after begin returns: not on this stack */
+	for (uint32_t f = 0; f < frames; f++, g_frame++)
+		for (uint32_t c = 0; c < calls; c++) {
+			j.frame = g_frame * 1000 + c;
+			j.work = work;
+			wbx_parallel_begin(draw, &j, SLICES);
+			for (uint32_t k = 0; k < 4096; k++)
+				g_side[k] = g_side[k] * 1103515245u + k + c;
+			if (c % 7 == 3) (void)getpid();
+			wbx_parallel_join();
+		}
+	uint64_t h = checksum();
+	for (uint32_t k = 0; k < 4096; k++) h = (h ^ g_side[k]) * 1099511628211ull;
+	return h;
+}
+
+ECL_EXPORT uint64_t PictureOnly(void) { return checksum(); }
+
 /* 1.0/3.0 rounded to nearest and up differ in the last bit: each task records what it
  * computes under the rounding the guest set before the call */
 static void rounding(void *arg, uint32_t i) {

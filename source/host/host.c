@@ -77,7 +77,7 @@ enum {
 	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_setaffinity=203, NR_sched_getaffinity=204, NR_pread64=17, NR_pwrite64=18, NR_socket=41, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72,
 	NR_fsync=74, NR_fdatasync=75, NR_sync=162, NR_syncfs=306,
-	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000, NR_wbx_parallel_for=2001,
+	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000, NR_wbx_parallel_for=2001, NR_wbx_parallel_begin=2002, NR_wbx_parallel_join=2003,
 	NR_getrusage=98,
 	NR_tkill=200, NR_exit_group=231, NR_tgkill=234,
 	NR_readlink=89, NR_readlinkat=267, NR_pipe=22, NR_pipe2=293,
@@ -286,6 +286,9 @@ static bool record_death(mb_context *c, bool say_stack, const char *fmt, va_list
 }
 
 void mb_host_guest_death(mb_context *c, const char *fmt, ...) {
+	/* the machine is about to be unwound: a begun parallel call's workers
+	 * must be out of it first */
+	mb_parallel_quiesce();
 	va_list ap;
 	va_start(ap, fmt);
 	const bool escapable = record_death(c, true, fmt, ap);
@@ -295,6 +298,7 @@ void mb_host_guest_death(mb_context *c, const char *fmt, ...) {
 }
 
 bool mb_host_guest_death_in_handler(mb_context *c, const char *fmt, ...) {
+	mb_parallel_quiesce();
 	va_list ap;
 	va_start(ap, fmt);
 	const bool escapable = record_death(c, false, fmt, ap);
@@ -501,6 +505,12 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 	/* Already dead - it died in a call made from inside a host callback, and the
 	 * guest that made the callback carried on regardless. It runs nothing more. */
 	if (h->context.dead && h->context.esc_rsp != 0) mb_guarded_escape_now(&h->context);
+	/* A begun parallel call (2002) is joined before any other system call:
+	 * the host may change the guest's memory map, its threads or its state
+	 * here, and none of that may happen with tasks still running. Joining
+	 * earlier than the guest asked changes nothing the guest can see. */
+	if (nr != NR_wbx_parallel_join && nr != NR_wbx_parallel_begin && mb_parallel_async())
+		mb_parallel_join(&h->context);
 	switch (nr) {
 		case NR_sched_yield: case NR_clock_gettime: case NR_nanosleep: case NR_clock_nanosleep:
 		case NR_futex: case NR_gettid: case NR_getpid: break;
@@ -905,6 +915,15 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			}
 			return mb_threads_yield(h->threads, &h->context);
 		}
+		case NR_wbx_parallel_begin: {
+			/* (fn, arg, n): the tasks of wbx_parallel_for, started on the
+			 * workers; the guest goes on, and wbx_parallel_join waits
+			 * (parallel.c). With no workers they all run here and now. */
+			mb_sword r = mb_parallel_begin(&h->context, a1, a2, a3);
+			return r < 0 ? serr((int)-r) : sok(r);
+		}
+		case NR_wbx_parallel_join:
+			return sok(mb_parallel_join(&h->context));
 		case NR_wbx_parallel_for: {
 			/* (fn, arg, n): fn(arg, i) for every i below n, on the host's
 			 * worker threads, returning when all are done (parallel.c). Off,
@@ -1195,6 +1214,9 @@ void mb_host_diag_guest_output(mb_host *h) {
 }
 
 void mb_host_destroy(mb_host *h) {
+	/* a begun parallel call (2002) left open by the guest is waited for: no
+	 * task may run while the host reads, replaces or frees the machine */
+	mb_parallel_quiesce();
 #ifdef _WIN32
 	if (h && h->have_stop_thread) CloseHandle((HANDLE)h->stop_thread);
 #endif
@@ -1427,6 +1449,9 @@ static int files_load_then_end(mb_host *h, mb_read_cb r, uintptr_t ud, char *err
 }
 
 int mb_host_save_state(mb_host *h, mb_write_cb w, uintptr_t ud, char *errbuf, size_t errlen) {
+	/* a begun parallel call (2002) left open by the guest is waited for: no
+	 * task may run while the host reads, replaces or frees the machine */
+	mb_parallel_quiesce();
 	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
 	bool was_active = h->active; mb_host_activate(h);
 	int rc = -1;
@@ -1576,6 +1601,9 @@ static void poison_half_loaded(mb_host *h, const char *why) {
 }
 
 int mb_host_load_state(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, size_t errlen) {
+	/* a begun parallel call (2002) left open by the guest is waited for: no
+	 * task may run while the host reads, replaces or frees the machine */
+	mb_parallel_quiesce();
 	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
 	bool was_active = h->active; mb_host_activate(h);
 	/* A machine that died on another thread than the first is still "on" that
@@ -1667,6 +1695,9 @@ done:
 }
 
 int mb_host_delta_save(mb_host *h, bool forward, mb_write_cb w, uintptr_t ud, char *errbuf, size_t errlen) {
+	/* a begun parallel call (2002) left open by the guest is waited for: no
+	 * task may run while the host reads, replaces or frees the machine */
+	mb_parallel_quiesce();
 	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
 	if (!forward && h->epoch_threads == NULL) { snprintf(errbuf, errlen, "no epoch to reverse"); return -1; }
 	bool was_active = h->active; mb_host_activate(h);
@@ -1691,6 +1722,9 @@ done:
 }
 
 int mb_host_delta_apply(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, size_t errlen) {
+	/* a begun parallel call (2002) left open by the guest is waited for: no
+	 * task may run while the host reads, replaces or frees the machine */
+	mb_parallel_quiesce();
 	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
 	bool was_active = h->active; mb_host_activate(h);
 	h->block->load_touched = false;   /* until the block says otherwise */
